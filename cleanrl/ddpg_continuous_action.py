@@ -4,10 +4,11 @@ import os
 import random
 import time
 from distutils.util import strtobool
-
+from collections import defaultdict
 import gymnasium as gym
 import numpy as np
 import torch
+import wandb
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -26,9 +27,7 @@ def parse_args():
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
     parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, cuda will be enabled by default")
-    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="verticle_ddpg",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -36,7 +35,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="HalfCheetah-v4",
+    parser.add_argument("--env-id", type=str, default="Hopper-v2",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
@@ -56,8 +55,13 @@ def parse_args():
         help="timestep to start learning")
     parser.add_argument("--policy-frequency", type=int, default=2,
         help="the frequency of training policy (delayed)")
+    parser.add_argument("--episode_log_interval", type=int, default=int(10),)
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
+    parser.add_argument('--ita', type=float, default=0.05)
+    parser.add_argument("--use_residual_grad", action='store_true')
+    parser.add_argument("--grad_verticle", action='store_true')
+    parser.add_argument("--use_agressive", action='store_true')
     args = parser.parse_args()
     # fmt: on
     return args
@@ -129,22 +133,14 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
 
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    wandb.init(
+        project=args.wandb_project_name,
+        entity=args.wandb_entity,
+        config=vars(args),
+        name=run_name,
+        monitor_gym=True,
+        save_code=True,
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -180,6 +176,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+    train_info = defaultdict(lambda: [])
+    eval_info = defaultdict(lambda: [])
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -197,9 +195,13 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         if "final_info" in infos:
             for info in infos["final_info"]:
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                eval_info["episode_return"].append(info["episode"]["r"])
+                eval_info["episode_length"].append(info["episode"]["l"])
+                if len(eval_info["episode_return"]) == args.episode_log_interval:
+                    print(f"global_step={global_step+1}, episodic_return={info['episode']['r']}")
+                    wandb.log({"episodic return mean": np.mean(eval_info["episode_return"]), "episode length mean": np.mean(eval_info["episode_length"])}, step=global_step+1)
+                    eval_info["episode_return"].clear()
+                    eval_info["episode_length"].clear()
                 break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
@@ -221,14 +223,54 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+            if not args.use_residual_grad:
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                q_optimizer.zero_grad()
+                qf1_loss.backward()
+                q_optimizer.step()
+            else:
+                with torch.no_grad():
+                    qf1_target_values = qf1_target(data.observations, data.actions).view(-1)
+                qf1_next = qf1(data.next_observations, next_state_actions)
+                next_q_pred = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next).view(-1)
+                if args.grad_verticle:
+                    forward_loss = F.mse_loss(qf1_a_values, next_q_value)
+                    backward_loss = args.ita * F.mse_loss(qf1_target_values, next_q_pred)
+                    qf1_loss = forward_loss + backward_loss
+                    q_optimizer.zero_grad(set_to_none=True)
+                    forward_grad_list, backward_grad_list, grad_shape_list = [], [], []
+                    forward_loss.backward()
+                    for param in list(qf1.parameters()):
+                        forward_grad_list.append(param.grad.clone().detach().reshape(-1))
+                        grad_shape_list.append(param.grad.shape)
+                    backward_loss.backward()
+                    for i, param in enumerate(list(qf1.parameters())):
+                        backward_grad_list.append(param.grad.clone().detach().reshape(-1) - forward_grad_list[i])
+                    forward_grad, backward_grad = torch.cat(forward_grad_list), torch.cat(backward_grad_list)
+                    cosine_similarity = torch.nn.functional.cosine_similarity(forward_grad, -1 * backward_grad, dim=0).item()
+                    train_info["grad cosine sim"].append(cosine_similarity)
+                    parallel_coef = (torch.dot(forward_grad, backward_grad) / max(torch.dot(forward_grad, forward_grad), 1e-10)).item() # avoid zero grad caused by f*
+                    if args.use_agressive:
+                        forward_grad = (1 - min(parallel_coef, 0)) * forward_grad + backward_grad
+                    else:
+                        forward_grad = (1 - parallel_coef) * forward_grad + backward_grad
 
-            # optimize the model
-            q_optimizer.zero_grad()
-            qf1_loss.backward()
-            q_optimizer.step()
+                    param_idx = 0
+                    for i, grad in enumerate(forward_grad_list):
+                        forward_grad_list[i] = forward_grad[param_idx: param_idx+grad.shape[0]]
+                        param_idx += grad.shape[0]
+                    # reset gradient and calculate
+                    q_optimizer.zero_grad(set_to_none=True)
+                    for i, param in enumerate(list(qf1.parameters())):
+                        param.grad = forward_grad_list[i].reshape(grad_shape_list[i])
+                    q_optimizer.step()
+                else:
+                    qf1_loss = F.mse_loss(qf1_a_values, next_q_value) + args.ita * F.mse_loss(qf1_target_values, next_q_pred)
+                    q_optimizer.zero_grad()
+                    qf1_loss.backward()
+                    q_optimizer.step()
 
-            if global_step % args.policy_frequency == 0:
+            if (global_step + 1) % args.policy_frequency == 0:
                 actor_loss = -qf1(data.observations, actor(data.observations)).mean()
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
@@ -240,12 +282,15 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            if global_step % 100 == 0:
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+            train_info["qf loss"].append(qf1_loss.item())
+            train_info["actor loss"].append(actor_loss.item())
+
+            if (global_step + 1) % 10000 == 0:
+                for key, value_list in list(train_info.items()):
+                    if key == "grad cosine sim":
+                        train_info["grad cosine sim std"] = np.var(value_list)
+                    train_info[key] = np.mean(value_list)
+                wandb.log(train_info, step=global_step+1)
+                train_info = defaultdict(lambda: [])
 
     envs.close()
-    writer.close()
