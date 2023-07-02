@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument('--ita', type=float, default=0.05)
     parser.add_argument("--use_residual_grad", action='store_true')
     parser.add_argument("--grad_verticle", action='store_true')
-    parser.add_argument("--use_agressive", action='store_true')
+    parser.add_argument("--grad_agressive", action='store_true')
     args = parser.parse_args()
     # fmt: on
     return args
@@ -233,42 +233,39 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     qf1_target_values = qf1_target(data.observations, data.actions).view(-1)
                 qf1_next = qf1(data.next_observations, next_state_actions)
                 next_q_pred = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next).view(-1)
-                if args.grad_verticle:
-                    forward_loss = F.mse_loss(qf1_a_values, next_q_value)
-                    backward_loss = args.ita * F.mse_loss(qf1_target_values, next_q_pred)
-                    qf1_loss = forward_loss + backward_loss
-                    q_optimizer.zero_grad(set_to_none=True)
-                    forward_grad_list, backward_grad_list, grad_shape_list = [], [], []
-                    forward_loss.backward()
-                    for param in list(qf1.parameters()):
-                        forward_grad_list.append(param.grad.clone().detach().reshape(-1))
-                        grad_shape_list.append(param.grad.shape)
-                    backward_loss.backward()
-                    for i, param in enumerate(list(qf1.parameters())):
-                        backward_grad_list.append(param.grad.clone().detach().reshape(-1) - forward_grad_list[i])
-                    forward_grad, backward_grad = torch.cat(forward_grad_list), torch.cat(backward_grad_list)
-                    cosine_similarity = torch.nn.functional.cosine_similarity(forward_grad, -1 * backward_grad, dim=0).item()
-                    train_info["grad cosine sim"].append(cosine_similarity)
-                    parallel_coef = (torch.dot(forward_grad, backward_grad) / max(torch.dot(forward_grad, forward_grad), 1e-10)).item() # avoid zero grad caused by f*
-                    if args.use_agressive:
-                        forward_grad = (1 - min(parallel_coef, 0)) * forward_grad + backward_grad
-                    else:
-                        forward_grad = (1 - parallel_coef) * forward_grad + backward_grad
 
-                    param_idx = 0
-                    for i, grad in enumerate(forward_grad_list):
-                        forward_grad_list[i] = forward_grad[param_idx: param_idx+grad.shape[0]]
-                        param_idx += grad.shape[0]
-                    # reset gradient and calculate
-                    q_optimizer.zero_grad(set_to_none=True)
-                    for i, param in enumerate(list(qf1.parameters())):
-                        param.grad = forward_grad_list[i].reshape(grad_shape_list[i])
-                    q_optimizer.step()
+                forward_loss = F.mse_loss(qf1_a_values, next_q_value)
+                backward_loss = args.ita * F.mse_loss(qf1_target_values, next_q_pred)
+                qf1_loss = forward_loss + backward_loss
+                q_optimizer.zero_grad(set_to_none=True)
+                forward_grad_list, backward_grad_list, grad_shape_list = [], [], []
+                forward_loss.backward()
+                for param in list(qf1.parameters()):
+                    forward_grad_list.append(param.grad.clone().detach().reshape(-1))
+                    grad_shape_list.append(param.grad.shape)
+                backward_loss.backward()
+                for i, param in enumerate(list(qf1.parameters())):
+                    backward_grad_list.append(param.grad.clone().detach().reshape(-1) - forward_grad_list[i])
+                forward_grad, backward_grad = torch.cat(forward_grad_list), torch.cat(backward_grad_list)
+                cosine_similarity = torch.nn.functional.cosine_similarity(forward_grad, -1 * backward_grad, dim=0).item()
+                train_info["grad cosine sim"].append(cosine_similarity)
+                parallel_coef = (torch.dot(forward_grad, backward_grad) / max(torch.dot(forward_grad, forward_grad), 1e-10)).item() # avoid zero grad caused by f*
+                if args.grad_agressive:
+                    forward_grad = (1 - min(parallel_coef, 0)) * forward_grad + backward_grad
+                elif args.grad_verticle:
+                    forward_grad = (1 - parallel_coef) * forward_grad + backward_grad
                 else:
-                    qf1_loss = F.mse_loss(qf1_a_values, next_q_value) + args.ita * F.mse_loss(qf1_target_values, next_q_pred)
-                    q_optimizer.zero_grad()
-                    qf1_loss.backward()
-                    q_optimizer.step()
+                    forward_grad = forward_grad + backward_grad
+
+                param_idx = 0
+                for i, grad in enumerate(forward_grad_list):
+                    forward_grad_list[i] = forward_grad[param_idx: param_idx+grad.shape[0]]
+                    param_idx += grad.shape[0]
+                # reset gradient and calculate
+                q_optimizer.zero_grad(set_to_none=True)
+                for i, param in enumerate(list(qf1.parameters())):
+                    param.grad = forward_grad_list[i].reshape(grad_shape_list[i])
+                q_optimizer.step()
 
             if (global_step + 1) % args.policy_frequency == 0:
                 actor_loss = -qf1(data.observations, actor(data.observations)).mean()
