@@ -134,14 +134,14 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    wandb.init(
-        project=args.wandb_project_name,
-        entity=args.wandb_entity,
-        config=vars(args),
-        name=run_name,
-        monitor_gym=True,
-        save_code=True,
-    )
+    # wandb.init(
+    #     project=args.wandb_project_name,
+    #     entity=args.wandb_entity,
+    #     config=vars(args),
+    #     name=run_name,
+    #     monitor_gym=True,
+    #     save_code=True,
+    # )
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -199,7 +199,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 eval_info["episode_length"].append(info["episode"]["l"])
                 if len(eval_info["episode_return"]) == args.episode_log_interval:
                     print(f"global_step={global_step+1}, episodic_return={info['episode']['r']}")
-                    wandb.log({"episodic return mean": np.mean(eval_info["episode_return"]), "episode length mean": np.mean(eval_info["episode_length"])}, step=global_step+1)
+                    # wandb.log({"episodic return mean": np.mean(eval_info["episode_return"]), "episode length mean": np.mean(eval_info["episode_length"])}, step=global_step+1)
                     eval_info["episode_return"].clear()
                     eval_info["episode_length"].clear()
                 break
@@ -236,6 +236,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                 forward_loss = F.mse_loss(qf1_a_values, next_q_value)
                 backward_loss = args.ita * F.mse_loss(qf1_target_values, next_q_pred)
+                train_info["positive effect residual ratio"].append(torch.sum((next_q_value - qf1_a_values) * (next_q_pred - qf1_target_values) > 0) / qf1_a_values.shape[0])
                 qf1_loss = forward_loss + backward_loss
                 q_optimizer.zero_grad(set_to_none=True)
                 forward_grad_list, backward_grad_list, grad_shape_list = [], [], []
@@ -287,7 +288,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     if key == "grad cosine sim":
                         train_info["grad cosine sim std"] = np.var(value_list)
                     train_info[key] = np.mean(value_list)
-                wandb.log(train_info, step=global_step+1)
+                # wandb.log(train_info, step=global_step+1)
                 train_info = defaultdict(lambda: [])
 
     envs.close()
