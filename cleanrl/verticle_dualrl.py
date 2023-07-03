@@ -14,7 +14,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
+from torch.distributions import MultivariateNormal, Normal
 
+EXP_ADV_MAX = 100.
+LOG_STD_MAX = 2
+LOG_STD_MIN = -5
 
 def parse_args():
     # fmt: off
@@ -29,7 +33,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--device", type=int, default=0,
         help="cuda device")
-    parser.add_argument("--wandb-project-name", type=str, default="verticle_ddpg",
+    parser.add_argument("--wandb-project-name", type=str, default="online_verticle_dualrl",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -60,10 +64,15 @@ def parse_args():
     parser.add_argument("--episode_log_interval", type=int, default=int(10),)
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
-    parser.add_argument('--ita', type=float, default=0.05)
+    parser.add_argument('--f_name', type=str, default="Pearson_square_chi")
+    parser.add_argument('--ita', type=float, default=0.1)
+    parser.add_argument('--Lambda', type=float, default=0.9)
+    parser.add_argument('--temperature', type=float, default=3.0)
     parser.add_argument("--use_residual_grad", action='store_true')
+    parser.add_argument("--grad_bidirectional", action='store_true')
     parser.add_argument("--grad_verticle", action='store_true')
     parser.add_argument("--grad_agressive", action='store_true')
+    parser.add_argument("--use_tanh", action='store_true')
     args = parser.parse_args()
     # fmt: on
     return args
@@ -85,17 +94,27 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
+def frenchel_dual(name, x):
+    if name == "Reverse_KL":
+        return torch.exp(x - 1)
+    elif name == "Pearson_square_chi":
+        return torch.max(x + x**2 / 4, torch.zeros_like(x))
+    elif name == "Smoothed_square_chi":
+        x = torch.max(x, torch.zeros_like(x))
+        return x + x**2 / 4
+
+def f_prime_inverse(name, x, temperatrue):
+    return torch.exp(x * temperatrue)
 
 # ALGO LOGIC: initialize agent here:
-class QNetwork(nn.Module):
+class VNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape), 256)
+        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
 
-    def forward(self, x, a):
-        x = torch.cat([x, a], 1)
+    def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
@@ -103,11 +122,13 @@ class QNetwork(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, use_tanh="False"):
         super().__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
         self.fc2 = nn.Linear(256, 256)
-        self.fc_mu = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.use_tanh = use_tanh
         # action rescaling
         self.register_buffer(
             "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
@@ -115,13 +136,25 @@ class Actor(nn.Module):
         self.register_buffer(
             "action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32)
         )
-
+    
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = torch.tanh(self.fc_mu(x))
-        return x * self.action_scale + self.action_bias
+        mean = self.fc_mean(x)
+        if self.use_tanh:
+            mean = torch.tanh(mean)
+        log_std = self.fc_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
+        scale_tril = torch.diag_embed(torch.exp(log_std))
+        return MultivariateNormal(mean, scale_tril=scale_tril)
 
+    def get_action(self, x):
+        normal = self(x)
+        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
+        y_t = torch.clip(x_t, min=-1.0, max=1.0)
+        action = y_t * self.action_scale + self.action_bias
+        return action
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -157,14 +190,16 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    actor = Actor(envs).to(device)
-    qf1 = QNetwork(envs).to(device)
-    qf1_target = QNetwork(envs).to(device)
-    target_actor = Actor(envs).to(device)
+    actor = Actor(envs, use_tanh=args.use_tanh).to(device)
+    vf = VNetwork(envs).to(device)
+    vf_target = VNetwork(envs).to(device)
+
+    target_actor = Actor(envs, use_tanh=args.use_tanh).to(device)
     target_actor.load_state_dict(actor.state_dict())
-    qf1_target.load_state_dict(qf1.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()), lr=args.learning_rate)
+    vf_target.load_state_dict(vf.state_dict())
+    v_optimizer = optim.Adam(list(vf.parameters()), lr=args.learning_rate)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
+    f_name, Lambda, ita, temperature = args.f_name, args.Lambda, args.ita, args.temperature
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -185,10 +220,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            with torch.no_grad():
-                actions = actor(torch.Tensor(obs).to(device))
-                actions += torch.normal(0, actor.action_scale * args.exploration_noise)
-                actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
+            actions = actor.get_action(torch.Tensor(obs).to(device))
+            actions = actions.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminateds, truncateds, infos = envs.step(actions)
@@ -220,34 +253,34 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                next_state_actions = target_actor(data.next_observations)
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
+                vf_target_value = vf_target(data.observations).view(-1)
+                vf_next_target_value = vf_target(data.next_observations).view(-1)
 
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
+            vf_values = vf(data.observations).view(-1)
+            vf_next_values = vf(data.next_observations).view(-1)
             if not args.use_residual_grad:
-                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-                q_optimizer.zero_grad()
-                qf1_loss.backward()
-                q_optimizer.step()
+                TD_error = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
+                dual_loss = (1 - Lambda) * vf_values + Lambda * frenchel_dual(f_name, TD_error)
+                pi_residual = TD_error.clone().detach()
+            elif not args.grad_bidirectional:
+                residual = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_values
+                dual_loss = (1 - Lambda) * vf_values + Lambda * frenchel_dual(f_name, residual)
+                pi_residual = residual.clone().detach()
             else:
-                with torch.no_grad():
-                    qf1_target_values = qf1_target(data.observations, data.actions).view(-1)
-                qf1_next = qf1(data.next_observations, next_state_actions)
-                next_q_pred = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next).view(-1)
-
-                forward_loss = F.mse_loss(qf1_a_values, next_q_value)
-                backward_loss = args.ita * F.mse_loss(qf1_target_values, next_q_pred)
-                train_info["positive effect residual ratio"].append(torch.sum((next_q_value - qf1_a_values) * (next_q_pred - qf1_target_values) > 0).item() / qf1_a_values.shape[0])
-                qf1_loss = forward_loss + backward_loss
-                q_optimizer.zero_grad(set_to_none=True)
-                forward_grad_list, backward_grad_list, grad_shape_list = [], [], []
-                forward_loss.backward()
-                for param in list(qf1.parameters()):
+                forward_bellman_error = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
+                backward_bellman_error = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_target_value
+                forward_loss = torch.mean(Lambda * frenchel_dual(f_name, forward_bellman_error))
+                backward_loss = torch.mean(Lambda * ita * frenchel_dual(f_name, backward_bellman_error))
+                pi_residual = forward_bellman_error.clone().detach()
+                
+            if args.use_residual_grad and args.grad_bidirectional:
+                v_optimizer.zero_grad(set_to_none=True)
+                forward_grad_list, backward_grad_list = [], []
+                forward_loss.backward(retain_graph=True)
+                for param in list(vf.parameters()):
                     forward_grad_list.append(param.grad.clone().detach().reshape(-1))
-                    grad_shape_list.append(param.grad.shape)
                 backward_loss.backward()
-                for i, param in enumerate(list(qf1.parameters())):
+                for i, param in enumerate(list(vf.parameters())):
                     backward_grad_list.append(param.grad.clone().detach().reshape(-1) - forward_grad_list[i])
                 forward_grad, backward_grad = torch.cat(forward_grad_list), torch.cat(backward_grad_list)
                 cosine_similarity = torch.nn.functional.cosine_similarity(forward_grad, -1 * backward_grad, dim=0).item()
@@ -262,28 +295,38 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                 param_idx = 0
                 for i, grad in enumerate(forward_grad_list):
-                    forward_grad_list[i] = forward_grad[param_idx: param_idx+grad.shape[0]]
+                    forward_grad_list[i] += forward_grad[param_idx: param_idx+grad.shape[0]]
                     param_idx += grad.shape[0]
                 # reset gradient and calculate
-                q_optimizer.zero_grad(set_to_none=True)
-                for i, param in enumerate(list(qf1.parameters())):
-                    param.grad = forward_grad_list[i].reshape(grad_shape_list[i])
-                q_optimizer.step()
+                v_optimizer.zero_grad(set_to_none=True)
+                torch.mean((1 - Lambda) * vf_values).backward()
+                for i, param in enumerate(list(vf.parameters())):
+                    param.grad += forward_grad_list[i].reshape(param.grad.shape)
+                v_optimizer.step()
+            else:
+                v_loss = torch.mean((1 - Lambda) * vf_values + Lambda * ita * dual_loss)
+                v_optimizer.zero_grad(set_to_none=True)
+                v_loss.backward()
+                v_optimizer.step()
 
             if (global_step + 1) % args.policy_frequency == 0:
-                actor_loss = -qf1(data.observations, actor(data.observations)).mean()
-                actor_optimizer.zero_grad()
-                actor_loss.backward()
+                weight = f_prime_inverse(f_name, pi_residual, temperature)
+                weight = torch.clamp_max(weight, EXP_ADV_MAX).detach()
+                policy_out = actor(data.observations)
+                bc_losses = -policy_out.log_prob((data.actions - actor.action_bias) / actor.action_scale)
+                policy_loss = torch.mean(weight * bc_losses)
+                actor_optimizer.zero_grad(set_to_none=True)
+                policy_loss.backward()
                 actor_optimizer.step()
 
                 # update the target network
                 for param, target_param in zip(actor.parameters(), target_actor.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                for param, target_param in zip(vf.parameters(), vf_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            train_info["qf loss"].append(qf1_loss.item())
-            train_info["actor loss"].append(actor_loss.item())
+            train_info["vf loss"].append(torch.mean(pi_residual**2).item())
+            train_info["actor loss"].append(policy_loss.item())
 
             if (global_step + 1) % 10000 == 0:
                 for key, value_list in list(train_info.items()):
