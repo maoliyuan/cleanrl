@@ -68,6 +68,8 @@ def parse_args():
     parser.add_argument('--ita', type=float, default=0.1)
     parser.add_argument('--Lambda', type=float, default=0.9)
     parser.add_argument('--temperature', type=float, default=3.0)
+    parser.add_argument('--alpha', type=float, default=0.2, help="Entropy regularization coefficient.")
+    parser.add_argument("--fixed_alpha", action='store_true')
     parser.add_argument("--use_residual_grad", action='store_true')
     parser.add_argument("--grad_bidirectional", action='store_true')
     parser.add_argument("--grad_verticle", action='store_true')
@@ -154,7 +156,8 @@ class Actor(nn.Module):
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
         y_t = torch.clip(x_t, min=-1.0, max=1.0)
         action = y_t * self.action_scale + self.action_bias
-        return action
+        log_prob = normal.log_prob(x_t)
+        return action, log_prob
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -200,6 +203,13 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     v_optimizer = optim.Adam(list(vf.parameters()), lr=args.learning_rate)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
     f_name, Lambda, ita, temperature = args.f_name, args.Lambda, args.ita, args.temperature
+    if not args.fixed_alpha:
+        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
+        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        alpha = log_alpha.exp().item()
+        a_optimizer = optim.Adam([log_alpha], lr=args.learning_rate)
+    else:
+        alpha = args.alpha
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -220,7 +230,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            actions = actor.get_action(torch.Tensor(obs).to(device))
+            actions, _ = actor.get_action(torch.Tensor(obs).to(device))
             actions = actions.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -253,22 +263,23 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
+                _, next_action_log_pi = actor.get_action(data.next_observations)
                 vf_target_value = vf_target(data.observations).view(-1)
                 vf_next_target_value = vf_target(data.next_observations).view(-1)
 
             vf_values = vf(data.observations).view(-1)
             vf_next_values = vf(data.next_observations).view(-1)
             if not args.use_residual_grad:
-                TD_error = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
+                TD_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
                 dual_loss = (1 - Lambda) * vf_values + Lambda * frenchel_dual(f_name, TD_error)
                 pi_residual = TD_error.clone().detach()
             elif not args.grad_bidirectional:
-                residual = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_values
+                residual = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_values
                 dual_loss = (1 - Lambda) * vf_values + Lambda * frenchel_dual(f_name, residual)
                 pi_residual = residual.clone().detach()
             else:
-                forward_bellman_error = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
-                backward_bellman_error = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_target_value
+                forward_bellman_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
+                backward_bellman_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_target_value
                 forward_loss = torch.mean(Lambda * frenchel_dual(f_name, forward_bellman_error))
                 backward_loss = torch.mean(Lambda * ita * frenchel_dual(f_name, backward_bellman_error))
                 pi_residual = forward_bellman_error.clone().detach()
@@ -325,8 +336,18 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for param, target_param in zip(vf.parameters(), vf_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
+            if not args.fixed_alpha:
+                with torch.no_grad():
+                    _, log_pi = actor.get_action(data.observations)
+                alpha_loss = (-log_alpha * (log_pi + target_entropy)).mean()
+                a_optimizer.zero_grad()
+                alpha_loss.backward()
+                a_optimizer.step()
+                alpha = log_alpha.exp().item()
+
             train_info["vf loss"].append(torch.mean(pi_residual**2).item())
             train_info["actor loss"].append(policy_loss.item())
+            train_info["alpha"].append(alpha)
 
             if (global_step + 1) % 10000 == 0:
                 for key, value_list in list(train_info.items()):
