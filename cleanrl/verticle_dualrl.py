@@ -75,10 +75,15 @@ def parse_args():
     parser.add_argument("--grad_verticle", action='store_true')
     parser.add_argument("--grad_agressive", action='store_true')
     parser.add_argument("--use_tanh", action='store_true')
+    parser.add_argument("--use_squash", action='store_true')
     args = parser.parse_args()
     # fmt: on
     return args
 
+
+def check_args(args):
+    if args.grad_verticle or args.grad_agressive:
+        assert args.use_residual_grad and args.grad_bidirectional
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
@@ -124,13 +129,14 @@ class VNetwork(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, env, use_tanh="False"):
+    def __init__(self, env, use_tanh=False, use_squash=True):
         super().__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
         self.use_tanh = use_tanh
+        self.use_squash = use_squash
         # action rescaling
         self.register_buffer(
             "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
@@ -154,10 +160,22 @@ class Actor(nn.Module):
     def get_action(self, x):
         normal = self(x)
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.clip(x_t, min=-1.0, max=1.0)
-        action = y_t * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(x_t)
+        if self.use_squash:
+            y_t = torch.tanh(x_t)
+            action = y_t * self.action_scale + self.action_bias
+            log_prob = normal.log_prob(x_t)
+            log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-10)
+        else:
+            y_t = torch.clip(x_t, min=-1.0, max=1.0)
+            action = y_t * self.action_scale + self.action_bias
+            log_prob = normal.log_prob(x_t)
         return action, log_prob
+    
+    def unsquash_action(self, action):
+        if self.use_squash:
+            return torch.log((1 + action) / (1 - action) + 1e-10) / 2
+        else:
+            return action
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -171,6 +189,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    check_args(args)
 
     wandb.init(
         project=args.wandb_project_name,
@@ -193,7 +212,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    actor = Actor(envs, use_tanh=args.use_tanh).to(device)
+    actor = Actor(envs, use_tanh=args.use_tanh, use_squash=args.use_squash).to(device)
     vf = VNetwork(envs).to(device)
     vf_target = VNetwork(envs).to(device)
 
@@ -324,7 +343,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 weight = f_prime_inverse(f_name, pi_residual, temperature)
                 weight = torch.clamp_max(weight, EXP_ADV_MAX).detach()
                 policy_out = actor(data.observations)
-                bc_losses = -policy_out.log_prob((data.actions - actor.action_bias) / actor.action_scale)
+                unnormalized_action = ((data.actions - actor.action_bias) / actor.action_scale)
+                log_prob = policy_out.log_prob(actor.unsquash_action(unnormalized_action))
+                if args.use_squash:
+                    bc_losses = -1 * (log_prob - torch.log(actor.action_scale * (1 - unnormalized_action.pow(2)) + 1e-10))
+                else:
+                    bc_losses = -1 * log_prob
                 policy_loss = torch.mean(weight * bc_losses)
                 actor_optimizer.zero_grad(set_to_none=True)
                 policy_loss.backward()
@@ -339,6 +363,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             if not args.fixed_alpha:
                 with torch.no_grad():
                     _, log_pi = actor.get_action(data.observations)
+                    train_info["action probability"].append(torch.exp(log_pi).mean().item())
                 alpha_loss = (-log_alpha * (log_pi.detach() + target_entropy)).mean()
                 a_optimizer.zero_grad()
                 alpha_loss.backward()
