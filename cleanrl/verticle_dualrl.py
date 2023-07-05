@@ -84,6 +84,8 @@ def parse_args():
 def check_args(args):
     if args.grad_verticle or args.grad_agressive:
         assert args.use_residual_grad and args.grad_bidirectional
+    if args.use_squash:
+        assert not args.use_tanh
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
