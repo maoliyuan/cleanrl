@@ -59,12 +59,8 @@ def parse_args():
         help="the scale of exploration noise")
     parser.add_argument("--learning-starts", type=int, default=25e3,
         help="timestep to start learning")
-    parser.add_argument("--policy-frequency", type=int, default=1,
+    parser.add_argument("--policy-frequency", type=int, default=2,
         help="the frequency of training policy (delayed)")
-    parser.add_argument("--value-frequency", type=int, default=1,
-        help="the frequency of training value (delayed)")
-    parser.add_argument("--sample-efficiency", type=int, default=1,
-        help="the number of updating steps after one global step")
     parser.add_argument("--episode_log_interval", type=int, default=int(10),)
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
@@ -169,7 +165,8 @@ class Actor(nn.Module):
         if self.use_squash:
             y_t = torch.tanh(x_t)
             action = y_t * self.action_scale + self.action_bias
-            log_prob = normal.log_prob(x_t) - torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6).sum(dim=-1)
+            log_prob = normal.log_prob(x_t)
+            log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-10)
         else:
             y_t = torch.clip(x_t, min=-1.0, max=1.0)
             action = y_t * self.action_scale + self.action_bias
@@ -178,7 +175,7 @@ class Actor(nn.Module):
     
     def unsquash_action(self, action):
         if self.use_squash:
-            return torch.log((1 + action) / (1 + 1e-6 - action) + 1e-6) / 2
+            return torch.log((1 + action) / (1 - action) + 1e-10) / 2
         else:
             return action
 
@@ -221,6 +218,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     vf = VNetwork(envs).to(device)
     vf_target = VNetwork(envs).to(device)
 
+    target_actor = Actor(envs, use_tanh=args.use_tanh).to(device)
+    target_actor.load_state_dict(actor.state_dict())
     vf_target.load_state_dict(vf.state_dict())
     v_optimizer = optim.Adam(list(vf.parameters()), lr=args.learning_rate)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
@@ -283,85 +282,86 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            for substep in range(args.sample_efficiency):
-                data = rb.sample(args.batch_size)
-                with torch.no_grad():
-                    _, next_action_log_pi = actor.get_action(data.next_observations)
-                    vf_target_value = vf_target(data.observations).view(-1)
-                    vf_next_target_value = vf_target(data.next_observations).view(-1)
+            data = rb.sample(args.batch_size)
+            with torch.no_grad():
+                _, next_action_log_pi = actor.get_action(data.next_observations)
+                vf_target_value = vf_target(data.observations).view(-1)
+                vf_next_target_value = vf_target(data.next_observations).view(-1)
 
-                vf_values = vf(data.observations).view(-1)
-                vf_next_values = vf(data.next_observations).view(-1)
-                if not args.use_residual_grad:
-                    TD_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
-                    dual_loss = (1 - Lambda) * vf_values + Lambda * frenchel_dual(f_name, TD_error)
-                    pi_residual = TD_error.clone().detach()
-                elif not args.grad_bidirectional:
-                    residual = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_values
-                    dual_loss = (1 - Lambda) * vf_values + Lambda * frenchel_dual(f_name, residual)
-                    pi_residual = residual.clone().detach()
+            vf_values = vf(data.observations).view(-1)
+            vf_next_values = vf(data.next_observations).view(-1)
+            if not args.use_residual_grad:
+                TD_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
+                dual_loss = (1 - Lambda) * vf_values + Lambda * frenchel_dual(f_name, TD_error)
+                pi_residual = TD_error.clone().detach()
+            elif not args.grad_bidirectional:
+                residual = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_values
+                dual_loss = (1 - Lambda) * vf_values + Lambda * frenchel_dual(f_name, residual)
+                pi_residual = residual.clone().detach()
+            else:
+                forward_bellman_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
+                backward_bellman_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_target_value
+                forward_loss = torch.mean(Lambda * frenchel_dual(f_name, forward_bellman_error))
+                backward_loss = torch.mean(Lambda * ita * frenchel_dual(f_name, backward_bellman_error))
+                pi_residual = forward_bellman_error.clone().detach()
+                
+            if args.use_residual_grad and args.grad_bidirectional:
+                v_optimizer.zero_grad(set_to_none=True)
+                forward_grad_list, backward_grad_list = [], []
+                forward_loss.backward(retain_graph=True)
+                for param in list(vf.parameters()):
+                    forward_grad_list.append(param.grad.clone().detach().reshape(-1))
+                backward_loss.backward()
+                for i, param in enumerate(list(vf.parameters())):
+                    backward_grad_list.append(param.grad.clone().detach().reshape(-1) - forward_grad_list[i])
+                forward_grad, backward_grad = torch.cat(forward_grad_list), torch.cat(backward_grad_list)
+                cosine_similarity = torch.nn.functional.cosine_similarity(forward_grad, -1 * backward_grad, dim=0).item()
+                train_info["grad cosine sim"].append(cosine_similarity)
+                parallel_coef = (torch.dot(forward_grad, backward_grad) / max(torch.dot(forward_grad, forward_grad), 1e-10)).item() # avoid zero grad caused by f*
+                if args.grad_agressive:
+                    forward_grad = (1 - min(parallel_coef, 0)) * forward_grad + backward_grad
+                elif args.grad_verticle:
+                    forward_grad = (1 - parallel_coef) * forward_grad + backward_grad
                 else:
-                    forward_bellman_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_target_value) - vf_values
-                    backward_bellman_error = (data.rewards.flatten() - alpha * next_action_log_pi) + (1 - data.dones.flatten()) * args.gamma * (vf_next_values) - vf_target_value
-                    forward_loss = torch.mean(Lambda * frenchel_dual(f_name, forward_bellman_error))
-                    backward_loss = torch.mean(Lambda * ita * frenchel_dual(f_name, backward_bellman_error))
-                    pi_residual = forward_bellman_error.clone().detach()
-                
-                if (global_step * args.sample_efficiency + substep + 1) % args.value_frequency == 0:
-                    if args.use_residual_grad and args.grad_bidirectional:
-                        v_optimizer.zero_grad(set_to_none=True)
-                        forward_grad_list, backward_grad_list = [], []
-                        forward_loss.backward(retain_graph=True)
-                        for param in list(vf.parameters()):
-                            forward_grad_list.append(param.grad.clone().detach().reshape(-1))
-                        backward_loss.backward()
-                        for i, param in enumerate(list(vf.parameters())):
-                            backward_grad_list.append(param.grad.clone().detach().reshape(-1) - forward_grad_list[i])
-                        forward_grad, backward_grad = torch.cat(forward_grad_list), torch.cat(backward_grad_list)
-                        cosine_similarity = torch.nn.functional.cosine_similarity(forward_grad, -1 * backward_grad, dim=0).item()
-                        train_info["grad cosine sim"].append(cosine_similarity)
-                        parallel_coef = (torch.dot(forward_grad, backward_grad) / max(torch.dot(forward_grad, forward_grad), 1e-10)).item() # avoid zero grad caused by f*
-                        if args.grad_agressive:
-                            forward_grad = (1 - min(parallel_coef, 0)) * forward_grad + backward_grad
-                        elif args.grad_verticle:
-                            forward_grad = (1 - parallel_coef) * forward_grad + backward_grad
-                        else:
-                            forward_grad = forward_grad + backward_grad
+                    forward_grad = forward_grad + backward_grad
 
-                        param_idx = 0
-                        for i, grad in enumerate(forward_grad_list):
-                            forward_grad_list[i] += forward_grad[param_idx: param_idx+grad.shape[0]]
-                            param_idx += grad.shape[0]
-                        # reset gradient and calculate
-                        v_optimizer.zero_grad(set_to_none=True)
-                        torch.mean((1 - Lambda) * vf_values).backward()
-                        for i, param in enumerate(list(vf.parameters())):
-                            param.grad += forward_grad_list[i].reshape(param.grad.shape)
-                        v_optimizer.step()
-                    else:
-                        v_loss = torch.mean((1 - Lambda) * vf_values + Lambda * ita * dual_loss)
-                        v_optimizer.zero_grad(set_to_none=True)
-                        v_loss.backward()
-                        v_optimizer.step()
-                    # update the target network
-                    for param, target_param in zip(vf.parameters(), vf_target.parameters()):
-                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                param_idx = 0
+                for i, grad in enumerate(forward_grad_list):
+                    forward_grad_list[i] += forward_grad[param_idx: param_idx+grad.shape[0]]
+                    param_idx += grad.shape[0]
+                # reset gradient and calculate
+                v_optimizer.zero_grad(set_to_none=True)
+                torch.mean((1 - Lambda) * vf_values).backward()
+                for i, param in enumerate(list(vf.parameters())):
+                    param.grad += forward_grad_list[i].reshape(param.grad.shape)
+                v_optimizer.step()
+            else:
+                v_loss = torch.mean((1 - Lambda) * vf_values + Lambda * ita * dual_loss)
+                v_optimizer.zero_grad(set_to_none=True)
+                v_loss.backward()
+                v_optimizer.step()
 
-                if (global_step * args.sample_efficiency + substep + 1) % args.policy_frequency == 0:
-                    weight = f_prime_inverse(f_name, pi_residual, temperature)
-                    weight = torch.clamp_max(weight, EXP_ADV_MAX).detach()
-                    policy_out = actor(data.observations)
-                    unnormalized_action = ((data.actions - actor.action_bias) / actor.action_scale)
-                    log_prob = policy_out.log_prob(actor.unsquash_action(unnormalized_action))
-                    if args.use_squash:
-                        bc_losses = -1 * (log_prob - torch.log(actor.action_scale * (1 - unnormalized_action.pow(2)) + 1e-6).sum(dim=-1))
-                    else:
-                        bc_losses = -1 * log_prob
-                    policy_loss = torch.mean(weight * bc_losses)
-                    actor_optimizer.zero_grad(set_to_none=True)
-                    policy_loss.backward()
-                    actor_optimizer.step()
-                
+            if (global_step + 1) % args.policy_frequency == 0:
+                weight = f_prime_inverse(f_name, pi_residual, temperature)
+                weight = torch.clamp_max(weight, EXP_ADV_MAX).detach()
+                policy_out = actor(data.observations)
+                unnormalized_action = ((data.actions - actor.action_bias) / actor.action_scale)
+                log_prob = policy_out.log_prob(actor.unsquash_action(unnormalized_action))
+                if args.use_squash:
+                    bc_losses = -1 * (log_prob - torch.log(actor.action_scale * (1 - unnormalized_action.pow(2)) + 1e-10))
+                else:
+                    bc_losses = -1 * log_prob
+                policy_loss = torch.mean(weight * bc_losses)
+                actor_optimizer.zero_grad(set_to_none=True)
+                policy_loss.backward()
+                actor_optimizer.step()
+
+                # update the target network
+                for param, target_param in zip(actor.parameters(), target_actor.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                for param, target_param in zip(vf.parameters(), vf_target.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+
             if not args.fixed_alpha:
                 with torch.no_grad():
                     _, log_pi = actor.get_action(data.observations)
