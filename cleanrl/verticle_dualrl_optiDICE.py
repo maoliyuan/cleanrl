@@ -71,6 +71,7 @@ def parse_args():
     parser.add_argument('--f_name', type=str, default="Pearson_square_chi")
     parser.add_argument('--ita', type=float, default=0.1)
     parser.add_argument('--Lambda', type=float, default=0.9)
+    parser.add_argument('--beta', type=float, default=0.2)
     parser.add_argument('--temperature', type=float, default=3.0)
     parser.add_argument('--alpha', type=float, default=0.2, help="Entropy regularization coefficient.")
     parser.add_argument("--fixed_alpha", action='store_true')
@@ -387,6 +388,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 alpha = log_alpha.exp().item()
 
             train_info["vf loss"].append(torch.mean(pi_residual**2).item())
+            train_info["af loss"].append(adv_loss.item())
             train_info["actor loss"].append(policy_loss.item())
             train_info["alpha"].append(alpha)
 
